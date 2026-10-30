@@ -5,9 +5,11 @@ export PATH
 #=================================================
 #	System: CentOS 6/7, Debian 8+, Ubuntu 16+
 #	Description: 一键全自动优化加速你的服务器
-#	Version: 1.0.4
-#	Author: 静水流深
-#	QQ群: 615298
+#	Version: 1.0.5
+#	Maintainer: brian952700
+#	Repository: https://github.com/brian952700/bbr-script
+#	Upstream: adsorgcn/bbr-script (静水流深); ylx2016/Linux-NetSpeed
+#	License: MIT (see LICENSE)
 #=================================================
 
 RED='\033[0;31m'
@@ -16,7 +18,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-sh_ver="1.0.4"
+sh_ver="1.0.5"
 
 # 检查root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用root用户运行此脚本${PLAIN}" && exit 1
@@ -589,11 +591,13 @@ show_status() {
 show_menu() {
     clear
     echo -e "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${BLUE}║       BBR一键加速脚本 v${sh_ver} (优化版)        ║${PLAIN}"
+    echo -e "${BLUE}║       BBR一键加速脚本 v${sh_ver} (Brian版)        ║${PLAIN}"
     echo -e "${BLUE}║       适用于Linux新手，自动检测依赖            ║${PLAIN}"
     echo -e "${BLUE}║                                                 ║${PLAIN}"
-    echo -e "${BLUE}║       作者: 静水流深    QQ群: 615298           ║${PLAIN}"
+    echo -e "${BLUE}║       维护者: brian952700           ║${PLAIN}"
     echo -e "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}"
+    echo -e "${BLUE}项目: https://github.com/brian952700/bbr-script${PLAIN}"
+    echo -e "${BLUE}反馈: https://github.com/brian952700/bbr-script/issues${PLAIN}"
     echo ""
     show_status
     echo -e "${GREEN}1.${PLAIN} 安装/启用 BBR ${YELLOW}(推荐先选此项)${PLAIN}"
@@ -686,3 +690,4 @@ fi
 
 # 脚本入口
 show_menu
+
