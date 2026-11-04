@@ -7,6 +7,28 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
+# 仅支持 Debian 12 及以上；必须在下载、依赖安装或配置修改之前检查。
+check_supported_system() {
+    local ID="" VERSION_ID=""
+    if [[ ! -r /etc/os-release ]]; then
+        echo "错误：无法识别系统，仅支持 Debian 12 及以上。" >&2
+        return 1
+    fi
+    . /etc/os-release
+    local major=${VERSION_ID%%.*}
+    if [[ "$ID" != "debian" || ! "$major" =~ ^[0-9]+$ ]]; then
+        echo "错误：仅支持 Debian 12 及以上，当前系统：${ID:-未知} ${VERSION_ID:-未知}。" >&2
+        return 1
+    fi
+    if ! dpkg --compare-versions "$major" ge 12; then
+        echo "错误：仅支持 Debian 12 及以上，当前版本：$VERSION_ID。" >&2
+        return 1
+    fi
+    OS="$ID"
+    VER="$VERSION_ID"
+}
+check_supported_system || exit 1
+
 script_url="https://raw.githubusercontent.com/brian952700/bbr-script/main/newbbr.sh"
 script_file=$(mktemp)
 trap 'rm -f -- "$script_file"' EXIT
@@ -27,4 +49,5 @@ if [[ ! -s "$script_file" ]]; then
 fi
 bash -n "$script_file"
 bash "$script_file" "$@"
+
 

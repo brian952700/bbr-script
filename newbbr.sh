@@ -3,9 +3,9 @@ PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
 #=================================================
-#	System: CentOS 6/7, Debian 8+, Ubuntu 16+
+#	System: Debian 12+
 #	Description: 一键全自动优化加速你的服务器
-#	Version: 1.0.5
+#	Version: 1.1.0
 #	Maintainer: brian952700
 #	Repository: https://github.com/brian952700/bbr-script
 #	Upstream: adsorgcn/bbr-script (静水流深); ylx2016/Linux-NetSpeed
@@ -18,38 +18,32 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-sh_ver="1.0.5"
+sh_ver="1.1.0"
 
 # 检查root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用root用户运行此脚本${PLAIN}" && exit 1
 
-# 最小化环境引导：确保curl可用（解决curl未安装无法下载脚本的问题）
-if ! command -v curl &>/dev/null; then
-    echo -e "${YELLOW}检测到curl未安装，正在自动安装...${PLAIN}"
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y curl
-    elif command -v yum &>/dev/null; then
-        yum install -y curl
+# 仅支持 Debian 12 及以上；必须在下载、依赖安装或配置修改之前检查。
+check_supported_system() {
+    local ID="" VERSION_ID=""
+    if [[ ! -r /etc/os-release ]]; then
+        echo "错误：无法识别系统，仅支持 Debian 12 及以上。" >&2
+        return 1
     fi
-    if ! command -v curl &>/dev/null; then
-        echo -e "${RED}curl安装失败，请手动安装后重试: apt install curl 或 yum install curl${PLAIN}"
-        exit 1
-    fi
-    echo -e "${GREEN}curl安装完成${PLAIN}"
-fi
-
-# 系统信息
-if [[ -f /etc/os-release ]]; then
     . /etc/os-release
-    OS=$ID
-    VER=$VERSION_ID
-elif [[ -f /etc/redhat-release ]]; then
-    OS="centos"
-    VER=$(grep -oE '[0-9]+' /etc/redhat-release | head -1)
-else
-    echo -e "${RED}不支持的系统${PLAIN}"
-    exit 1
-fi
+    local major=${VERSION_ID%%.*}
+    if [[ "$ID" != "debian" || ! "$major" =~ ^[0-9]+$ ]]; then
+        echo "错误：仅支持 Debian 12 及以上，当前系统：${ID:-未知} ${VERSION_ID:-未知}。" >&2
+        return 1
+    fi
+    if ! dpkg --compare-versions "$major" ge 12; then
+        echo "错误：仅支持 Debian 12 及以上，当前版本：$VERSION_ID。" >&2
+        return 1
+    fi
+    OS="$ID"
+    VER="$VERSION_ID"
+}
+check_supported_system || exit 1
 
 # 架构检测
 ARCH=$(uname -m)
@@ -59,59 +53,22 @@ echo -e "${BLUE}检测到系统: $OS $VER ($ARCH)${PLAIN}"
 
 # 检查必要依赖并自动安装
 check_dependencies() {
-    echo -e "${BLUE}检查系统依赖...${PLAIN}"
-    
-    # 检测包管理器
-    if [[ "$OS" =~ centos|rhel|fedora ]]; then
-        PKG_MANAGER="yum"
-        PKG_INSTALL="yum install -y"
-        DEPS="ca-certificates wget curl"
-    elif [[ "$OS" =~ debian|ubuntu ]]; then
-        PKG_MANAGER="apt-get"
-        PKG_INSTALL="apt-get install -y"
-        DEPS="ca-certificates wget curl"
-    else
-        echo -e "${YELLOW}未知包管理器，跳过依赖检查${PLAIN}"
-        return 0
-    fi
-    
-    # 检查并安装依赖
+    local dep
     local need_install=()
-    for dep in $DEPS; do
-        local installed=0
-        # ca-certificates 是包名不是命令，需要特殊检测
-        if [[ "$dep" == "ca-certificates" ]]; then
-            rpm -q ca-certificates &>/dev/null && installed=1
-            dpkg -l ca-certificates 2>/dev/null | grep -q "^ii" && installed=1
-            [[ -f /etc/ssl/certs/ca-certificates.crt || -f /etc/pki/tls/certs/ca-bundle.crt ]] && installed=1
-        else
-            command -v "$dep" &>/dev/null && installed=1
-        fi
-        [[ $installed -eq 0 ]] && need_install+=("$dep")
+    for dep in curl wget kmod procps; do
+        case "$dep" in
+            kmod) command -v modprobe >/dev/null 2>&1 || need_install+=("$dep") ;;
+            procps) command -v sysctl >/dev/null 2>&1 || need_install+=("$dep") ;;
+            *) command -v "$dep" >/dev/null 2>&1 || need_install+=("$dep") ;;
+        esac
     done
-    
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || need_install+=(ca-certificates)
     if [[ ${#need_install[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}缺少依赖: ${need_install[*]}${PLAIN}"
-        echo -e "${BLUE}正在自动安装依赖...${PLAIN}"
-        
-        if [[ "$OS" =~ centos|rhel|fedora ]]; then
-            $PKG_INSTALL ${need_install[*]}
-            # 更新CA证书
-            update-ca-trust force-enable 2>/dev/null
-        elif [[ "$OS" =~ debian|ubuntu ]]; then
-            apt-get update -qq
-            $PKG_INSTALL ${need_install[*]}
-            # 更新CA证书
-            update-ca-certificates 2>/dev/null
+        echo -e "${BLUE}安装依赖: ${need_install[*]}${PLAIN}"
+        if ! apt-get update || ! apt-get install -y "${need_install[@]}"; then
+            echo -e "${RED}依赖安装失败，请检查 apt 软件源后重试。${PLAIN}" >&2
+            return 1
         fi
-        
-        if [[ $? -eq 0 ]]; then
-            echo -e "${GREEN}依赖安装完成${PLAIN}"
-        else
-            echo -e "${RED}依赖安装失败，可能影响脚本运行${PLAIN}"
-        fi
-    else
-        echo -e "${GREEN}所有依赖已安装${PLAIN}"
     fi
 }
 
@@ -193,69 +150,6 @@ check_network() {
     fi
 }
 
-# 修复CentOS死源
-fixCentOSRepo() {
-    [[ ! "$OS" =~ centos ]] && return
-    [[ "$VER" != "6" && "$VER" != "7" && "$VER" != "8" ]] && return
-    
-    echo -e "${YELLOW}检测到CentOS ${VER}，官方源已停服，切换到Vault/阿里云源...${PLAIN}"
-    mkdir -p /etc/yum.repos.d/backup
-    mv /etc/yum.repos.d/CentOS-*.repo /etc/yum.repos.d/backup/ 2>/dev/null
-    
-    if [[ "$VER" == "7" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<'EOF'
-[base]
-name=CentOS-7-Vault-Base
-baseurl=https://mirrors.aliyun.com/centos-vault/7.9.2009/os/$basearch/
-gpgcheck=0
-enabled=1
-[updates]
-name=CentOS-7-Vault-Updates
-baseurl=https://mirrors.aliyun.com/centos-vault/7.9.2009/updates/$basearch/
-gpgcheck=0
-enabled=1
-[extras]
-name=CentOS-7-Vault-Extras
-baseurl=https://mirrors.aliyun.com/centos-vault/7.9.2009/extras/$basearch/
-gpgcheck=0
-enabled=1
-EOF
-    elif [[ "$VER" == "6" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<'EOF'
-[base]
-name=CentOS-6-Vault-Base
-baseurl=https://mirrors.aliyun.com/centos-vault/6.10/os/$basearch/
-gpgcheck=0
-enabled=1
-[updates]
-name=CentOS-6-Vault-Updates
-baseurl=https://mirrors.aliyun.com/centos-vault/6.10/updates/$basearch/
-gpgcheck=0
-enabled=1
-EOF
-    elif [[ "$VER" == "8" ]]; then
-        cat > /etc/yum.repos.d/CentOS-Vault.repo <<'EOF'
-[baseos]
-name=CentOS-8-Vault-BaseOS
-baseurl=https://mirrors.aliyun.com/centos-vault/8.5.2111/BaseOS/$basearch/os/
-gpgcheck=0
-enabled=1
-[appstream]
-name=CentOS-8-Vault-AppStream
-baseurl=https://mirrors.aliyun.com/centos-vault/8.5.2111/AppStream/$basearch/os/
-gpgcheck=0
-enabled=1
-[extras]
-name=CentOS-8-Vault-Extras
-baseurl=https://mirrors.aliyun.com/centos-vault/8.5.2111/extras/$basearch/os/
-gpgcheck=0
-enabled=1
-EOF
-    fi
-    yum clean all >/dev/null 2>&1
-    echo -e "${GREEN}CentOS ${VER} Vault源配置完成${PLAIN}"
-}
-
 # 检测BBR状态
 check_bbr_status() {
     local param=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
@@ -330,212 +224,32 @@ EOF
     fi
 }
 
-# Ubuntu/Debian升级内核
+# 从当前 Debian 软件源安装本架构的内核元包，不更换软件源。
 upgrade_kernel_debian() {
-    echo -e "${BLUE}正在为 $OS $VER 升级内核...${PLAIN}"
-    
-    # 检测当前内核
-    current_kernel=$(uname -r | cut -d- -f1)
-    local major=$(echo "$current_kernel" | cut -d. -f1)
-    local minor=$(echo "$current_kernel" | cut -d. -f2)
-    
-    # 如果已经是5.4+，无需升级
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        echo -e "${GREEN}当前内核 $current_kernel 已是最新，无需升级${PLAIN}"
-        enable_bbr
-        return 0
-    fi
-    
-    # 切换到国内镜像源加速下载
-    echo -e "${BLUE}切换到国内镜像源加速下载...${PLAIN}"
-    if [[ "$OS" == "ubuntu" ]]; then
-        sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null
-        sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null
-    elif [[ "$OS" == "debian" ]]; then
-        sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null
-        sed -i 's|http://security.debian.org|https://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null
-    fi
-    
-    echo -e "${BLUE}更新软件包列表...${PLAIN}"
-    apt-get update
-    
-    # 动态获取架构，兼容ARM/x86
-    local DPKG_ARCH=$(dpkg --print-architecture)
-    
-    # Ubuntu 20.04+和Debian 11+的内核已经是5.4+
-    if [[ "$OS" == "ubuntu" ]]; then
-        if [[ "$VER" =~ ^(20|22|24) ]]; then
-            echo -e "${BLUE}安装最新内核...${PLAIN}"
-            apt-get install -y linux-generic
-        elif [[ "$VER" == "18" ]]; then
-            echo -e "${BLUE}安装HWE内核(5.4)...${PLAIN}"
-            apt-get install -y --install-recommends linux-generic-hwe-18.04
-        else
-            echo -e "${BLUE}安装HWE内核...${PLAIN}"
-            apt-get install -y --install-recommends linux-generic-hwe-16.04 2>/dev/null || \
-            apt-get install -y linux-generic
-        fi
-    elif [[ "$OS" == "debian" ]]; then
-        echo -e "${BLUE}安装最新内核（架构: $DPKG_ARCH）...${PLAIN}"
-        apt-get install -y linux-image-$DPKG_ARCH
-    fi
-    
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}╔════════════════════════════════════════════╗${PLAIN}"
-        echo -e "${GREEN}║  内核升级完成！                           ║${PLAIN}"
-        echo -e "${GREEN}║  需要重启系统才能使用新内核               ║${PLAIN}"
-        echo -e "${GREEN}╚════════════════════════════════════════════╝${PLAIN}"
-        return 0
-    else
-        echo -e "${RED}内核升级失败${PLAIN}"
-        return 1
-    fi
-}
-
-# CentOS升级内核（使用ELRepo或官方仓库）
-upgrade_kernel_centos() {
-    # CentOS 8+ 不支持，直接提示换系统
-    if [[ -n "$VER" && "$VER" -ge 8 ]] 2>/dev/null; then
-        echo ""
-        echo -e "${RED}╔══════════════════════════════════════════════════════╗${PLAIN}"
-        echo -e "${RED}║      ⚠  不支持 CentOS ${VER} 及以上版本升级内核        ║${PLAIN}"
-        echo -e "${RED}╠══════════════════════════════════════════════════════╣${PLAIN}"
-        echo -e "${RED}║  CentOS 8+ 官方已停止维护，ELRepo 支持不稳定，      ║${PLAIN}"
-        echo -e "${RED}║  强行升级内核极易导致系统损坏或无法启动。            ║${PLAIN}"
-        echo -e "${RED}║                                                      ║${PLAIN}"
-        echo -e "${YELLOW}║  推荐更换为以下系统后再使用本脚本：                 ║${PLAIN}"
-        echo -e "${GREEN}║    ✔  Ubuntu 20.04 / 22.04 / 24.04               ║${PLAIN}"
-        echo -e "${GREEN}║    ✔  Debian 10 / 11 / 12                        ║${PLAIN}"
-        echo -e "${YELLOW}║                                                      ║${PLAIN}"
-        echo -e "${YELLOW}║  如需继续使用 CentOS，可考虑迁移到：               ║${PLAIN}"
-        echo -e "${YELLOW}║    ✔  Rocky Linux 8/9  （CentOS 官方替代品）      ║${PLAIN}"
-        echo -e "${YELLOW}║    ✔  AlmaLinux 8/9                               ║${PLAIN}"
-        echo -e "${RED}╚══════════════════════════════════════════════════════╝${PLAIN}"
-        echo ""
-        read -n1 -rp "按任意键返回主菜单..." key
-        return 1
-    fi
-
-    echo -e "${BLUE}正在为 CentOS $VER 升级内核...${PLAIN}"
-    
-    # 检测当前内核
-    current_kernel=$(uname -r | cut -d- -f1)
-    local major=$(echo "$current_kernel" | cut -d. -f1)
-    local minor=$(echo "$current_kernel" | cut -d. -f2)
-    
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        echo -e "${GREEN}当前内核 $current_kernel 已支持BBR${PLAIN}"
-        enable_bbr
-        return 0
-    fi
-    
-    fixCentOSRepo
-    
-    if [[ "$VER" == "7" ]]; then
-        # 配置yum超时参数，避免重复追加
-        echo -e "${BLUE}配置yum参数（防止下载超时）...${PLAIN}"
-        grep -q "^timeout=" /etc/yum.conf || echo "timeout=30" >> /etc/yum.conf
-        grep -q "^retries=" /etc/yum.conf || echo "retries=3" >> /etc/yum.conf
-        
-        # 尝试从ELRepo安装（优先阿里云镜像）
-        echo -e "${BLUE}安装ELRepo源...${PLAIN}"
-        rpm --import https://mirrors.aliyun.com/elrepo/RPM-GPG-KEY-elrepo.org 2>/dev/null || \
-        rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
-        
-        yum install -y https://mirrors.aliyun.com/elrepo/elrepo/el7/x86_64/RPMS/elrepo-release-7.0-6.el7.elrepo.noarch.rpm 2>/dev/null || \
-        yum install -y https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm
-        
-        # 清理缓存
-        echo -e "${BLUE}清理yum缓存...${PLAIN}"
-        yum clean all
-        
-        # 安装最新主线内核
-        echo -e "${YELLOW}╔════════════════════════════════════════════════════╗${PLAIN}"
-        echo -e "${YELLOW}║  正在下载内核（6.x），文件较大约150-200MB        ║${PLAIN}"
-        echo -e "${YELLOW}║  预计需要3-10分钟，请耐心等待...                  ║${PLAIN}"
-        echo -e "${YELLOW}║  脚本会自动重试，如长时间无进度可Ctrl+C中断      ║${PLAIN}"
-        echo -e "${YELLOW}╚════════════════════════════════════════════════════╝${PLAIN}"
-        echo ""
-        
-        # 尝试3次
-        local attempt=1
-        local max_attempts=3
-        local success=0
-        
-        while [[ $attempt -le $max_attempts ]]; do
-            echo -e "${BLUE}尝试安装内核 (第 $attempt/$max_attempts 次)...${PLAIN}"
-            
-            # 使用yum自带的超时机制
-            yum --enablerepo=elrepo-kernel install -y kernel-ml kernel-ml-devel
-            
-            if [[ $? -eq 0 ]]; then
-                success=1
-                break
-            else
-                echo -e "${RED}安装失败，准备重试...${PLAIN}"
-                yum clean all
-                attempt=$((attempt + 1))
-                [[ $attempt -le $max_attempts ]] && sleep 3
-            fi
-        done
-        
-        if [[ $success -eq 1 ]]; then
-            # 设置默认启动新内核
-            echo -e "${BLUE}配置GRUB启动项...${PLAIN}"
-            grub2-set-default 0
-            grub2-mkconfig -o /boot/grub2/grub.cfg
-            echo -e "${GREEN}╔════════════════════════════════════════════╗${PLAIN}"
-            echo -e "${GREEN}║  内核升级完成！                           ║${PLAIN}"
-            echo -e "${GREEN}║  需要重启系统才能使用新内核               ║${PLAIN}"
-            echo -e "${GREEN}╚════════════════════════════════════════════╝${PLAIN}"
-            return 0
-        else
-            echo -e "${RED}╔═══════════════════════════════════════════════════╗${PLAIN}"
-            echo -e "${RED}║  内核升级失败（尝试${max_attempts}次后仍失败）    ║${PLAIN}"
-            echo -e "${RED}║                                                   ║${PLAIN}"
-            echo -e "${RED}║  建议手动操作：                                   ║${PLAIN}"
-            echo -e "${RED}║  1. yum clean all                                 ║${PLAIN}"
-            echo -e "${RED}║  2. yum --enablerepo=elrepo-kernel install -y kernel-ml ║${PLAIN}"
-            echo -e "${RED}║                                                   ║${PLAIN}"
-            echo -e "${RED}║  或者考虑升级到Rocky Linux / AlmaLinux           ║${PLAIN}"
-            echo -e "${RED}╚═══════════════════════════════════════════════════╝${PLAIN}"
+    local kernel_arch kernel_package
+    kernel_arch=$(dpkg --print-architecture) || return 1
+    case "$kernel_arch" in
+        amd64) kernel_package="linux-image-amd64" ;;
+        arm64) kernel_package="linux-image-arm64" ;;
+        armhf) kernel_package="linux-image-armmp" ;;
+        *)
+            echo -e "${RED}当前架构 $kernel_arch 暂不支持自动安装内核，请手动选择合适的 Debian 内核包。${PLAIN}"
             return 1
-        fi
-    else
-        echo -e "${RED}CentOS $VER 不支持自动升级内核${PLAIN}"
-        return 1
+            ;;
+    esac
+    echo -e "${BLUE}正在从当前 Debian 软件源安装/更新 $kernel_package...${PLAIN}"
+    if apt-get update && apt-get install -y "$kernel_package"; then
+        echo -e "${GREEN}内核包安装/更新完成；若安装了新内核，重启后生效。${PLAIN}"
+        return 0
     fi
+    echo -e "${RED}内核安装/更新失败，请检查软件源和包管理器输出。${PLAIN}" >&2
+    return 1
 }
 
 # 卸载多余旧内核（保留当前和最新）
 remove_old_kernels() {
     echo -e "${YELLOW}检测旧内核...${PLAIN}"
     
-    if [[ "$OS" =~ centos|rhel ]]; then
-        # 列出所有已安装内核
-        installed_kernels=$(rpm -qa | grep ^kernel-[0-9] | sort -V)
-        kernel_count=$(echo "$installed_kernels" | wc -l)
-        
-        if [[ $kernel_count -gt 2 ]]; then
-            echo -e "${BLUE}发现 $kernel_count 个内核，保留最新2个${PLAIN}"
-            echo -e "${YELLOW}将要删除的内核：${PLAIN}"
-            echo "$installed_kernels" | head -n -2
-            
-            read -p "确认删除这些旧内核? [y/N]: " confirm_remove
-            if [[ "$confirm_remove" =~ ^[Yy]$ ]]; then
-                # 保留最新的2个，删除其他
-                old_kernels=$(echo "$installed_kernels" | head -n -2)
-                if [[ -n "$old_kernels" ]]; then
-                    echo "$old_kernels" | xargs yum remove -y
-                    echo -e "${GREEN}旧内核清理完成${PLAIN}"
-                fi
-            else
-                echo -e "${YELLOW}已取消${PLAIN}"
-            fi
-        else
-            echo -e "${GREEN}无需清理旧内核（当前: $kernel_count 个）${PLAIN}"
-        fi
-    elif [[ "$OS" =~ debian|ubuntu ]]; then
         current_kernel=$(uname -r)
         installed_kernels=$(dpkg -l | grep 'linux-image-[0-9]' | awk '{print $2}')
         
@@ -556,7 +270,6 @@ remove_old_kernels() {
         else
             echo -e "${YELLOW}已取消${PLAIN}"
         fi
-    fi
 }
 
 # 显示当前状态
@@ -592,7 +305,7 @@ show_menu() {
     clear
     echo -e "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}"
     echo -e "${BLUE}║       BBR一键加速脚本 v${sh_ver} (Brian版)        ║${PLAIN}"
-    echo -e "${BLUE}║       适用于Linux新手，自动检测依赖            ║${PLAIN}"
+    echo -e "${BLUE}║       仅支持 Debian 12+，自动检测依赖            ║${PLAIN}"
     echo -e "${BLUE}║                                                 ║${PLAIN}"
     echo -e "${BLUE}║       维护者: brian952700           ║${PLAIN}"
     echo -e "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}"
@@ -601,14 +314,13 @@ show_menu() {
     echo ""
     show_status
     echo -e "${GREEN}1.${PLAIN} 安装/启用 BBR ${YELLOW}(推荐先选此项)${PLAIN}"
-    echo -e "${GREEN}2.${PLAIN} 升级内核（Ubuntu/Debian）"
-    echo -e "${GREEN}3.${PLAIN} 升级内核（CentOS）"
+    echo -e "${GREEN}2.${PLAIN} 安装/更新内核（Debian）"
     echo -e "${GREEN}4.${PLAIN} 清理旧内核 ${YELLOW}(释放/boot空间)${PLAIN}"
     echo -e "${GREEN}5.${PLAIN} 查看状态"
     echo " -------------"
     echo -e "${GREEN}0.${PLAIN} 退出"
     echo ""
-    read -p "请选择操作 [0-5]: " choice
+    read -p "请选择操作 [0/1/2/4/5]: " choice
     
     case $choice in
         1)
@@ -616,27 +328,14 @@ show_menu() {
                 enable_bbr
             else
                 echo -e "${YELLOW}当前内核不支持BBR，请先升级内核${PLAIN}"
-                echo -e "${BLUE}提示：Ubuntu/Debian选2，CentOS选3${PLAIN}"
+                echo -e "${BLUE}提示：选择2安装 Debian 内核${PLAIN}"
             fi
             ;;
         2)
-            if [[ "$OS" =~ debian|ubuntu ]]; then
-                check_boot_space
-                upgrade_kernel_debian
-                read -p "是否现在重启? [y/N]: " reboot_now
+            check_boot_space
+            if upgrade_kernel_debian; then
+                read -r -p "是否现在重启? [y/N]: " reboot_now
                 [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-            else
-                echo -e "${RED}此选项仅适用于Ubuntu/Debian${PLAIN}"
-            fi
-            ;;
-        3)
-            if [[ "$OS" =~ centos|rhel ]]; then
-                check_boot_space
-                upgrade_kernel_centos
-                read -p "是否现在重启? [y/N]: " reboot_now
-                [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-            else
-                echo -e "${RED}此选项仅适用于CentOS${PLAIN}"
             fi
             ;;
         4)
@@ -650,7 +349,7 @@ show_menu() {
             exit 0
             ;;
         *)
-            echo -e "${RED}无效选择，请输入0-5${PLAIN}"
+            echo -e "${RED}无效选择，请输入0、1、2、4或5${PLAIN}"
             ;;
     esac
     
@@ -666,10 +365,9 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 
 # 执行所有预检查
-check_dependencies
-check_network
+check_dependencies || exit 1
+check_network || exit 1
 check_virt
-fixCentOSRepo
 
 echo ""
 echo -e "${GREEN}预检查完成！${PLAIN}"
@@ -690,4 +388,5 @@ fi
 
 # 脚本入口
 show_menu
+
 
