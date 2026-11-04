@@ -65,7 +65,7 @@ sysctl net.core.default_qdisc
 - BBR 启用会写入 `/etc/sysctl.d/99-bbr.conf` 并应用网络参数；效果取决于实际网络环境。
 - 升级内核、修改软件源或清理旧内核前，请备份数据与配置，保留可用的控制台和恢复方式。
 
-## TCP 调优与 Xray 建议
+## TCP 调优
 
 主菜单选择 `3`，进入调优子菜单：
 
@@ -80,23 +80,21 @@ sysctl net.core.default_qdisc
 
 这不是 BBR 的“激进版本”，也不保证提速。提高缓冲上限供高带宽、高延迟链路测试。线路拥塞、路由质量、CPU 和运营商限速仍可能成为瓶颈。请比较相同客户端、节点和时段下新连接的吞吐、延迟和内存占用；效果变差即可恢复。
 
-- 影响整台服务器的 TCP，不只影响 Xray；不改变 QUIC/UDP 自身的拥塞控制。
-- 默认拥塞算法主要影响新连接，已有连接不会统一切换。脚本不自动重启 Xray。
+- 影响整台服务器的 TCP；不改变 QUIC/UDP 自身的拥塞控制。
+- 默认拥塞算法主要影响新连接，已有连接不会统一切换。
 - 默认队列参数不强制替换现有网卡队列，可用 `tc qdisc show` 检查。
 - 独立配置：`/etc/sysctl.d/99-z-brian-bbr-tcp.conf`；首次运行值备份：`/var/lib/brian-bbr/tcp-before.conf`。换档不覆盖首次备份。恢复不会撤销首次调优前菜单1已启用的 BBR。
 - 应用失败时尝试恢复本次操作前的运行值；若权限不足导致回退也失败，输出错误及快照路径供手动检查。
 - 其他 sysctl 配置（包括 `/etc/sysctl.conf`）可能覆盖启动值；重启后请查看参数。恢复后的重启值由原有系统配置决定。
-- Xray 的 `sockopt.tcpcongestion` 可指定单独的拥塞算法，如已显式配置其他算法，需自行检查。脚本不修改 Xray JSON。
-- Fast Open 需要内核和 Xray socket 配合，建议单独测试兼容性，不应当作提高长期下载速度的开关；菜单3不改变此参数。
 
-参数依据：[Linux TCP sysctl](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)、[Xray Sockopt](https://xtls.github.io/en/config/transports/sockopt.html)。
+参数依据：[Linux TCP sysctl](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)。
 
 ## 更新日志
 
 ### v1.2.0（2026-11-04）
 
 - 新增菜单3：TCP 调优，包含两档、参数查看及恢复。
-- 独立配置、首次备份和失败回退，不修改 Xray 配置。
+- 独立配置、首次备份和失败回退。
 - BBR 已启用时仍显示主菜单。
 
 ### v1.1.0（2026-11-04）
