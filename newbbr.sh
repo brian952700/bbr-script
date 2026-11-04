@@ -5,7 +5,7 @@ export PATH
 #=================================================
 #	System: Debian 12+
 #	Description: 一键全自动优化加速你的服务器
-#	Version: 1.1.0
+#	Version: 1.2.0
 #	Maintainer: brian952700
 #	Repository: https://github.com/brian952700/bbr-script
 #	Upstream: adsorgcn/bbr-script (静水流深); ylx2016/Linux-NetSpeed
@@ -18,7 +18,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-sh_ver="1.1.0"
+sh_ver="1.2.0"
 
 # 检查root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用root用户运行此脚本${PLAIN}" && exit 1
@@ -300,6 +300,180 @@ show_status() {
     echo -e "${BLUE}=================================================${PLAIN}\n"
 }
 
+# TCP 调优：独立持久配置与首次运行值备份
+TCP_TUNE_FILE=/etc/sysctl.d/99-z-brian-bbr-tcp.conf
+TCP_TUNE_STATE=/var/lib/brian-bbr
+TCP_TUNE_BACKUP="$TCP_TUNE_STATE/tcp-before.conf"
+TCP_TUNE_KEYS=(
+    net.core.default_qdisc net.ipv4.tcp_congestion_control
+    net.core.rmem_max net.core.wmem_max
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+    net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_window_scaling
+    net.ipv4.tcp_sack net.ipv4.tcp_mtu_probing
+    net.ipv4.tcp_slow_start_after_idle
+)
+
+snapshot_tcp_values() {
+    local key value
+    for key in "${TCP_TUNE_KEYS[@]}"; do
+        value=$(sysctl -n "$key") || return 1
+        printf '%s = %s\n' "$key" "$value" || return 1
+    done
+}
+
+show_tcp_tuning() {
+    echo "当前 TCP 参数："
+    sysctl "${TCP_TUNE_KEYS[@]}"
+    if [[ -f "$TCP_TUNE_FILE" ]]; then
+        echo "已启用调优配置：$TCP_TUNE_FILE"
+        head -n 2 "$TCP_TUNE_FILE"
+    else
+        echo "尚未启用本脚本的 TCP 调优。"
+    fi
+}
+
+apply_tcp_tuning() {
+    local profile="$1" max_buffer before candidate mem_kb confirm
+    case "$profile" in
+        balanced) max_buffer=33554432 ;;
+        throughput)
+            mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+            if [[ ! "$mem_kb" =~ ^[0-9]+$ ]] || (( mem_kb < 2097152 )); then
+                echo "高吞吐档要求系统报告至少 2 GiB 内存，请使用均衡档。"
+                return 1
+            fi
+            max_buffer=67108864
+            ;;
+        *) return 1 ;;
+    esac
+    if [[ -e "$TCP_TUNE_FILE" ]] &&
+       ! grep -qxF '# Managed by brian952700/bbr-script TCP tuning' <(head -n 1 "$TCP_TUNE_FILE"); then
+        echo "调优文件不属于本脚本，请先手动检查：$TCP_TUNE_FILE"
+        return 1
+    fi
+    if [[ -e "$TCP_TUNE_FILE" && ! -s "$TCP_TUNE_BACKUP" ]]; then
+        echo "缺少原始参数备份，停止覆盖现有调优配置。"
+        return 1
+    fi
+    echo "启用 BBR + fq、TCP 自动缓冲调节、窗口扩展、SACK 和按需 MTU 黑洞探测。"
+    echo "收发缓冲上限：$((max_buffer / 1048576)) MiB；不会立即为每条连接分配全部内存。"
+    echo "影响全机 TCP，高并发可能增加内存占用；不保证提速，容器还需检查内存配额。"
+    echo "不更换内核、不修改 Xray 配置。"
+    read -r -p "确认应用? [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    modprobe tcp_bbr 2>/dev/null || true
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
+        echo "当前内核没有可用的 BBR，请检查内核和模块。"
+        return 1
+    fi
+    install -d -m 700 "$TCP_TUNE_STATE" || return 1
+    before=$(mktemp "$TCP_TUNE_STATE/current.XXXXXX") || return 1
+    if ! snapshot_tcp_values > "$before"; then
+        rm -f -- "$before"
+        echo "无法读取全部参数，未应用调优。"
+        return 1
+    fi
+    candidate=$(mktemp /etc/sysctl.d/.brian-bbr-tcp.XXXXXX) || {
+        rm -f -- "$before"
+        return 1
+    }
+    if ! cat > "$candidate" <<EOF
+# Managed by brian952700/bbr-script TCP tuning
+# profile=$profile; max_buffer=$max_buffer
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = $max_buffer
+net.core.wmem_max = $max_buffer
+net.ipv4.tcp_rmem = 4096 131072 $max_buffer
+net.ipv4.tcp_wmem = 4096 65536 $max_buffer
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+    then
+        rm -f -- "$before" "$candidate"
+        return 1
+    fi
+    if [[ ! -e "$TCP_TUNE_BACKUP" ]] && ! cp -- "$before" "$TCP_TUNE_BACKUP"; then
+        rm -f -- "$before" "$candidate"
+        return 1
+    fi
+    if ! sysctl -p "$candidate"; then
+        echo "应用失败，尝试恢复本次操作前的运行值。"
+        sysctl -p "$before" || echo "恢复也失败，请检查：$before"
+        rm -f -- "$candidate"
+        echo "配置未保存；本次快照保留在：$before"
+        return 1
+    fi
+    if ! chmod 644 "$candidate" || ! mv -f -- "$candidate" "$TCP_TUNE_FILE"; then
+        echo "保存配置失败，尝试恢复本次操作前的运行值。"
+        sysctl -p "$before" || echo "恢复也失败，请检查：$before"
+        rm -f -- "$candidate"
+        return 1
+    fi
+    rm -f -- "$before"
+    echo "TCP 调优已应用并保存，请用新建连接比较速度、延迟和内存占用。"
+    echo "默认拥塞算法主要影响新连接；default_qdisc 不强制替换现有网卡队列。"
+    echo "其他 sysctl 配置可能覆盖启动值，请重启后用子菜单3检查。"
+}
+
+restore_tcp_tuning() {
+    local confirm before
+    if [[ ! -s "$TCP_TUNE_BACKUP" ]]; then
+        echo "没有首次调优前的备份。"
+        return 1
+    fi
+    if [[ -e "$TCP_TUNE_FILE" ]] &&
+       ! grep -qxF '# Managed by brian952700/bbr-script TCP tuning' <(head -n 1 "$TCP_TUNE_FILE"); then
+        echo "文件不属于本脚本，停止恢复：$TCP_TUNE_FILE"
+        return 1
+    fi
+    echo "恢复首次调优前记录的运行值，并移除本功能的配置文件。"
+    echo "如果首次调优前已开启 BBR，恢复后仍保留 BBR。"
+    read -r -p "确认恢复? [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    before=$(mktemp "$TCP_TUNE_STATE/restore.XXXXXX") || return 1
+    if ! snapshot_tcp_values > "$before"; then
+        rm -f -- "$before"
+        return 1
+    fi
+    if ! sysctl -p "$TCP_TUNE_BACKUP"; then
+        echo "恢复失败，尝试回退本次操作。"
+        sysctl -p "$before" || echo "回退也失败，请检查：$before"
+        echo "配置和备份保留。"
+        return 1
+    fi
+    if ! rm -f -- "$TCP_TUNE_FILE"; then
+        echo "无法移除持久配置，尝试回退运行值；备份保留。"
+        sysctl -p "$before"
+        return 1
+    fi
+    rm -f -- "$TCP_TUNE_BACKUP" "$before"
+    echo "已恢复首次调优前参数，并移除调优文件。"
+}
+
+tcp_tuning_menu() {
+    local option
+    echo "========== TCP 调优（Xray / TCP 场景） =========="
+    echo "1. 均衡档：32 MiB 缓冲上限（建议先测试）"
+    echo "2. 高吞吐档：64 MiB 缓冲上限（至少 2 GiB 内存）"
+    echo "3. 查看当前参数"
+    echo "4. 恢复首次调优前的参数"
+    echo "0. 返回"
+    echo "不是 BBR 算法升级，不保证提速；不作用于 QUIC/UDP 的拥塞控制。"
+    read -r -p "请选择 [0-4]: " option
+    case "$option" in
+        1) apply_tcp_tuning balanced ;;
+        2) apply_tcp_tuning throughput ;;
+        3) show_tcp_tuning ;;
+        4) restore_tcp_tuning ;;
+        0) return 0 ;;
+        *) echo "无效选择" ;;
+    esac
+}
+
 # 主菜单
 show_menu() {
     clear
@@ -315,12 +489,13 @@ show_menu() {
     show_status
     echo -e "${GREEN}1.${PLAIN} 安装/启用 BBR ${YELLOW}(推荐先选此项)${PLAIN}"
     echo -e "${GREEN}2.${PLAIN} 安装/更新内核（Debian）"
+    echo -e "${GREEN}3.${PLAIN} TCP 调优（Xray 场景，可恢复）"
     echo -e "${GREEN}4.${PLAIN} 清理旧内核 ${YELLOW}(释放/boot空间)${PLAIN}"
     echo -e "${GREEN}5.${PLAIN} 查看状态"
     echo " -------------"
     echo -e "${GREEN}0.${PLAIN} 退出"
     echo ""
-    read -p "请选择操作 [0/1/2/4/5]: " choice
+    read -p "请选择操作 [0-5]: " choice
     
     case $choice in
         1)
@@ -338,6 +513,9 @@ show_menu() {
                 [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
             fi
             ;;
+        3)
+            tcp_tuning_menu
+            ;;
         4)
             remove_old_kernels
             ;;
@@ -349,7 +527,7 @@ show_menu() {
             exit 0
             ;;
         *)
-            echo -e "${RED}无效选择，请输入0、1、2、4或5${PLAIN}"
+            echo -e "${RED}无效选择，请输入0-5${PLAIN}"
             ;;
     esac
     
@@ -373,20 +551,8 @@ echo ""
 echo -e "${GREEN}预检查完成！${PLAIN}"
 sleep 1
 
-# 智能判断：如果BBR已启用且内核版本足够，无需进入菜单
-if check_bbr_status && check_kernel_native_bbr >/dev/null 2>&1; then
-    echo ""
-    show_status
-    echo -e "${GREEN}╔════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${GREEN}║  系统状态良好，BBR已启用，无需操作        ║${PLAIN}"
-    echo -e "${GREEN}╚════════════════════════════════════════════╝${PLAIN}"
-    echo ""
-    read -n1 -rp "按任意键退出..." key
-    echo ""
-    exit 0
-fi
-
 # 脚本入口
 show_menu
+
 
 

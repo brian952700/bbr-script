@@ -1,6 +1,6 @@
 # Brian BBR 一键加速脚本
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/brian952700/bbr-script)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/brian952700/bbr-script)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 由 **brian952700** 维护的 **Debian 12 及以上专用** BBR 管理脚本，提供 BBR 启用、内核升级、状态查看和旧内核清理菜单。
@@ -39,11 +39,12 @@ curl -fL --retry 3 --connect-timeout 15 --max-time 180 -o newbbr.sh https://raw.
 | --- | --- |
 | 1 | 安装/启用 BBR，建议先选择此项 |
 | 2 | 从当前 Debian 软件源安装/更新内核（amd64 / arm64 / armhf） |
+| 3 | TCP 调优：均衡 / 高吞吐 / 查看 / 恢复 |
 | 4 | 清理旧内核 |
 | 5 | 查看当前状态 |
 | 0 | 退出 |
 
-先选择 `1`；若提示内核不支持，再考虑升级内核。升级成功并重启后，重新执行安装命令，选择 `1` 启用 BBR。检测到 BBR 已启用且内核满足脚本条件时，脚本会显示状态后退出。
+先选择 `1`；若提示内核不支持，再考虑升级内核。升级成功并重启后，重新执行安装命令，选择 `1` 启用 BBR。即使 BBR 已启用也会进入菜单，方便调优或恢复。
 
 验证当前拥塞控制算法：
 
@@ -64,7 +65,39 @@ sysctl net.core.default_qdisc
 - BBR 启用会写入 `/etc/sysctl.d/99-bbr.conf` 并应用网络参数；效果取决于实际网络环境。
 - 升级内核、修改软件源或清理旧内核前，请备份数据与配置，保留可用的控制台和恢复方式。
 
+## TCP 调优与 Xray 建议
+
+主菜单选择 `3`，进入调优子菜单：
+
+| 子菜单 | 功能 |
+| --- | --- |
+| 1 均衡档 | 收发缓冲上限 32 MiB，建议先测试 |
+| 2 高吞吐档 | 收发缓冲上限 64 MiB，要求系统报告内存至少 2 GiB |
+| 3 查看 | 查看运行值与配置档位 |
+| 4 恢复 | 恢复首次调优前的运行值并移除调优文件 |
+
+两档都设置 BBR、fq 默认队列、自动接收缓冲调节、窗口扩展、SACK、按需 MTU 黑洞探测，并关闭空闲后的慢启动重置。缓冲上限不会立即全部分配，但高并发可能增加内存消耗；容器还需检查实际内存配额。
+
+这不是 BBR 的“激进版本”，也不保证提速。提高缓冲上限供高带宽、高延迟链路测试。线路拥塞、路由质量、CPU 和运营商限速仍可能成为瓶颈。请比较相同客户端、节点和时段下新连接的吞吐、延迟和内存占用；效果变差即可恢复。
+
+- 影响整台服务器的 TCP，不只影响 Xray；不改变 QUIC/UDP 自身的拥塞控制。
+- 默认拥塞算法主要影响新连接，已有连接不会统一切换。脚本不自动重启 Xray。
+- 默认队列参数不强制替换现有网卡队列，可用 `tc qdisc show` 检查。
+- 独立配置：`/etc/sysctl.d/99-z-brian-bbr-tcp.conf`；首次运行值备份：`/var/lib/brian-bbr/tcp-before.conf`。换档不覆盖首次备份。恢复不会撤销首次调优前菜单1已启用的 BBR。
+- 应用失败时尝试恢复本次操作前的运行值；若权限不足导致回退也失败，输出错误及快照路径供手动检查。
+- 其他 sysctl 配置（包括 `/etc/sysctl.conf`）可能覆盖启动值；重启后请查看参数。恢复后的重启值由原有系统配置决定。
+- Xray 的 `sockopt.tcpcongestion` 可指定单独的拥塞算法，如已显式配置其他算法，需自行检查。脚本不修改 Xray JSON。
+- Fast Open 需要内核和 Xray socket 配合，建议单独测试兼容性，不应当作提高长期下载速度的开关；菜单3不改变此参数。
+
+参数依据：[Linux TCP sysctl](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)、[Xray Sockopt](https://xtls.github.io/en/config/transports/sockopt.html)。
+
 ## 更新日志
+
+### v1.2.0（2026-11-04）
+
+- 新增菜单3：TCP 调优，包含两档、参数查看及恢复。
+- 独立配置、首次备份和失败回退，不修改 Xray 配置。
+- BBR 已启用时仍显示主菜单。
 
 ### v1.1.0（2026-11-04）
 
@@ -85,5 +118,6 @@ sysctl net.core.default_qdisc
 本仓库 fork 自 [adsorgcn/bbr-script](https://github.com/adsorgcn/bbr-script)，原维护者为 **静水流深**；该项目基于 [ylx2016/Linux-NetSpeed](https://github.com/ylx2016/Linux-NetSpeed) 改进。
 
 本分支由 [brian952700](https://github.com/brian952700) 维护。使用 [MIT License](LICENSE)，保留原作者版权声明。GitHub 上仍保留 fork 来源关系。
+
 
 
