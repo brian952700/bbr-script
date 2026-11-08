@@ -274,30 +274,29 @@ remove_old_kernels() {
 
 # 显示当前状态
 show_status() {
-    echo -e "\n${BLUE}==================== 系统状态 ====================${PLAIN}"
-    echo -e "${GREEN}系统:${PLAIN} $OS $VER"
-    echo -e "${GREEN}架构:${PLAIN} $ARCH"
-    echo -e "${GREEN}内核:${PLAIN} $(uname -r)"
-    
-    if check_bbr_status; then
-        echo -e "${GREEN}BBR状态:${PLAIN} ✅ 已启用"
+    local congestion qdisc bbr_status module_status
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    case "$congestion" in
+        bbr) bbr_status="✅ 已启用" ;;
+        "") bbr_status="未知" ;;
+        *) bbr_status="❌ 未启用" ;;
+    esac
+    if [[ -d /sys/module/tcp_bbr ]]; then
+        module_status="✅ 可见"
     else
-        echo -e "${GREEN}BBR状态:${PLAIN} ❌ 未启用"
+        module_status="未检测到"
     fi
-    
-    if lsmod | grep -q bbr; then
-        echo -e "${GREEN}BBR模块:${PLAIN} ✅ 已加载"
-    else
-        echo -e "${GREEN}BBR模块:${PLAIN} ❌ 未加载"
-    fi
-    
-    local qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')
-    echo -e "${GREEN}队列算法:${PLAIN} ${qdisc:-未设置}"
-    
-    local congestion=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-    echo -e "${GREEN}拥塞算法:${PLAIN} ${congestion:-未设置}"
-    
-    echo -e "${BLUE}=================================================${PLAIN}\n"
+    printf '%b\n' \
+        "${BLUE}==================== 系统状态 ====================${PLAIN}" \
+        "${GREEN}系统:${PLAIN} $OS $VER" \
+        "${GREEN}架构:${PLAIN} $ARCH" \
+        "${GREEN}内核:${PLAIN} $MENU_KERNEL_RELEASE" \
+        "${GREEN}BBR状态:${PLAIN} $bbr_status" \
+        "${GREEN}BBR模块:${PLAIN} $module_status" \
+        "${GREEN}队列算法:${PLAIN} ${qdisc:-未设置}" \
+        "${GREEN}拥塞算法:${PLAIN} ${congestion:-未设置}" \
+        "${BLUE}=================================================${PLAIN}"
 }
 
 # TCP 调优：独立持久配置与首次运行值备份
@@ -476,64 +475,71 @@ tcp_tuning_menu() {
 
 # 主菜单
 show_menu() {
-    clear
-    echo -e "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${BLUE}║       BBR一键加速脚本 v${sh_ver} (Brian版)        ║${PLAIN}"
-    echo -e "${BLUE}║       仅支持 Debian 12+，自动检测依赖            ║${PLAIN}"
-    echo -e "${BLUE}║                                                 ║${PLAIN}"
-    echo -e "${BLUE}║       维护者: brian952700           ║${PLAIN}"
-    echo -e "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}"
-    echo -e "${BLUE}项目: https://github.com/brian952700/bbr-script${PLAIN}"
-    echo -e "${BLUE}反馈: https://github.com/brian952700/bbr-script/issues${PLAIN}"
-    echo ""
-    show_status
-    echo -e "${GREEN}1.${PLAIN} 安装/启用 BBR ${YELLOW}(推荐先选此项)${PLAIN}"
-    echo -e "${GREEN}2.${PLAIN} 安装/更新内核（Debian）"
-    echo -e "${GREEN}3.${PLAIN} TCP 调优（Xray 场景，可恢复）"
-    echo -e "${GREEN}4.${PLAIN} 清理旧内核 ${YELLOW}(释放/boot空间)${PLAIN}"
-    echo -e "${GREEN}5.${PLAIN} 查看状态"
-    echo " -------------"
-    echo -e "${GREEN}0.${PLAIN} 退出"
-    echo ""
-    read -p "请选择操作 [0-5]: " choice
-    
-    case $choice in
-        1)
-            if check_kernel_native_bbr; then
-                enable_bbr
-            else
-                echo -e "${YELLOW}当前内核不支持BBR，请先升级内核${PLAIN}"
-                echo -e "${BLUE}提示：选择2安装 Debian 内核${PLAIN}"
-            fi
-            ;;
-        2)
-            check_boot_space
-            if upgrade_kernel_debian; then
-                read -r -p "是否现在重启? [y/N]: " reboot_now
-                [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-            fi
-            ;;
-        3)
-            tcp_tuning_menu
-            ;;
-        4)
-            remove_old_kernels
-            ;;
-        5)
-            show_status
-            ;;
-        0)
-            echo -e "${GREEN}感谢使用！${PLAIN}"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择，请输入0-5${PLAIN}"
-            ;;
-    esac
-    
-    echo ""
-    read -p "按回车键继续..." 
-    show_menu
+    local choice status reboot_now
+    while true; do
+        status=$(show_status)
+        if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then
+            printf '\033[H\033[2J'
+        fi
+        printf '%b\n' \
+            "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}" \
+            "${BLUE}║       BBR一键加速脚本 v${sh_ver} (Brian版)        ║${PLAIN}" \
+            "${BLUE}║       仅支持 Debian 12+，自动检测依赖            ║${PLAIN}" \
+            "${BLUE}║                                                 ║${PLAIN}" \
+            "${BLUE}║       维护者: brian952700           ║${PLAIN}" \
+            "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}" \
+            "${BLUE}项目: https://github.com/brian952700/bbr-script${PLAIN}" \
+            "${BLUE}反馈: https://github.com/brian952700/bbr-script/issues${PLAIN}" \
+            "" \
+            "$status" \
+            "" \
+            "${GREEN}1.${PLAIN} 安装/启用 BBR ${YELLOW}(推荐先选此项)${PLAIN}" \
+            "${GREEN}2.${PLAIN} 安装/更新内核（Debian）" \
+            "${GREEN}3.${PLAIN} TCP 调优（Xray 场景，可恢复）" \
+            "${GREEN}4.${PLAIN} 清理旧内核 ${YELLOW}(释放/boot空间)${PLAIN}" \
+            "${GREEN}5.${PLAIN} 查看状态" \
+            " -------------" \
+            "${GREEN}0.${PLAIN} 退出" \
+            ""
+        read -r -p "请选择操作 [0-5]: " choice || return 0
+
+        case $choice in
+            1)
+                if check_kernel_native_bbr; then
+                    enable_bbr
+                else
+                    echo -e "${YELLOW}当前内核不支持BBR，请先升级内核${PLAIN}"
+                    echo -e "${BLUE}提示：选择2安装 Debian 内核${PLAIN}"
+                fi
+                ;;
+            2)
+                check_boot_space
+                if upgrade_kernel_debian; then
+                    read -r -p "是否现在重启? [y/N]: " reboot_now
+                    [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
+                fi
+                ;;
+            3)
+                tcp_tuning_menu
+                ;;
+            4)
+                remove_old_kernels
+                ;;
+            5)
+                show_status
+                ;;
+            0)
+                echo -e "${GREEN}感谢使用！${PLAIN}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}无效选择，请输入0-5${PLAIN}"
+                ;;
+        esac
+
+        printf '\n'
+        read -r -p "按回车键继续..." || return 0
+    done
 }
 
 # 初始化检查
@@ -549,10 +555,11 @@ check_virt
 
 echo ""
 echo -e "${GREEN}预检查完成！${PLAIN}"
-sleep 1
 
 # 脚本入口
+MENU_KERNEL_RELEASE=$(uname -r)
 show_menu
+
 
 
 
