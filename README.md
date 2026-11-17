@@ -21,7 +21,7 @@ curl -fL --retry 3 --connect-timeout 15 --max-time 180 -o install.sh https://raw
 wget --tries=3 --timeout=30 -O install.sh https://raw.githubusercontent.com/brian952700/bbr-script/main/install.sh && bash install.sh
 ```
 
-入口脚本从本仓库下载最新版 `newbbr.sh`，下载失败会停止，语法检查通过后启动管理脚本。管理脚本会执行依赖检查等初始化操作，再显示交互菜单；不会自动选择升级内核。
+入口脚本从本仓库下载最新版 `newbbr.sh`，下载失败会停止，语法检查通过后启动管理脚本。下载完成后，管理脚本在本地完成系统检查并打开菜单。
 
 直接下载管理脚本后运行：
 
@@ -59,10 +59,11 @@ sysctl net.core.default_qdisc
 
 - 仅接受 `/etc/os-release` 中 `ID=debian` 且数字主版本不低于 12 的系统（例如 Debian 12、13）；更高版本按相同条件放行，实际可用性取决于内核和软件源。
 - Debian 11 及更早版本、Ubuntu、CentOS、其他发行版及无法识别版本的系统会在依赖安装或配置修改之前退出；安装入口也会先检查再下载。
-- 首次运行会使用 apt 安装缺少的依赖；不自动替换软件源，兼容已有的 sources.list 和 deb822 .sources 配置。
+- 本地已有 `newbbr.sh` 时可离线进入菜单。内核安装使用现有 APT 源，网络错误由 APT 报告。菜单写操作依赖 `flock`（`util-linux`），网络配置依赖 `sysctl`（`procps`）。
 - 内核更新按 dpkg 架构选择元包：amd64、arm64、armhf；其他架构仍可尝试启用现有内核的 BBR，但自动内核安装会给出提示后停止。
 - OpenVZ 等共享宿主内核的容器无法自行更换内核，BBR 是否可用取决于宿主机。
-- BBR 启用会写入 `/etc/sysctl.d/99-bbr.conf` 并应用网络参数；效果取决于实际网络环境。
+- 菜单 1 设置 BBR 和默认队列 fq，验证后保存到 `/etc/sysctl.d/99-brian-bbr.conf`。旧版 `/etc/sysctl.d/99-bbr.conf` 原样保留，其中的额外 TCP 参数可能仍生效。启用调优档位后，请先在菜单 3 恢复，再修改基础配置。
+- 菜单 4 保留正在运行的内核和最新备用内核，展示 APT 模拟计划后再清理。
 - 升级内核、修改软件源或清理旧内核前，请备份数据与配置，保留可用的控制台和恢复方式。
 
 ## TCP 调优
@@ -116,6 +117,3 @@ sysctl net.core.default_qdisc
 本仓库 fork 自 [adsorgcn/bbr-script](https://github.com/adsorgcn/bbr-script)，原维护者为 **静水流深**；该项目基于 [ylx2016/Linux-NetSpeed](https://github.com/ylx2016/Linux-NetSpeed) 改进。
 
 本分支由 [brian952700](https://github.com/brian952700) 维护。使用 [MIT License](LICENSE)，保留原作者版权声明。GitHub 上仍保留 fork 来源关系。
-
-
-

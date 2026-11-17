@@ -47,30 +47,8 @@ check_supported_system || exit 1
 
 # 架构检测
 ARCH=$(uname -m)
-[[ $ARCH == "x86_64" ]] && ARCH_NAME="amd64" || ARCH_NAME=$ARCH
 
 echo -e "${BLUE}检测到系统: $OS $VER ($ARCH)${PLAIN}"
-
-# 检查必要依赖并自动安装
-check_dependencies() {
-    local dep
-    local need_install=()
-    for dep in curl wget kmod procps; do
-        case "$dep" in
-            kmod) command -v modprobe >/dev/null 2>&1 || need_install+=("$dep") ;;
-            procps) command -v sysctl >/dev/null 2>&1 || need_install+=("$dep") ;;
-            *) command -v "$dep" >/dev/null 2>&1 || need_install+=("$dep") ;;
-        esac
-    done
-    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || need_install+=(ca-certificates)
-    if [[ ${#need_install[@]} -gt 0 ]]; then
-        echo -e "${BLUE}安装依赖: ${need_install[*]}${PLAIN}"
-        if ! apt-get update || ! apt-get install -y "${need_install[@]}"; then
-            echo -e "${RED}依赖安装失败，请检查 apt 软件源后重试。${PLAIN}" >&2
-            return 1
-        fi
-    fi
-}
 
 # 检查虚拟化类型
 check_virt() {
@@ -116,116 +94,110 @@ check_boot_space() {
             echo -e "${RED}警告：/boot分区空间不足 (可用: ${boot_available}MB)${PLAIN}"
             echo -e "${YELLOW}建议：先清理旧内核释放空间，或确保有至少100MB可用空间${PLAIN}"
             read -p "是否继续? [y/N]: " continue_boot
-            [[ ! "$continue_boot" =~ ^[Yy]$ ]] && exit 1
+            [[ "$continue_boot" =~ ^[Yy]$ ]] || return 1
         else
             echo -e "${GREEN}/boot分区空间充足 (可用: ${boot_available}MB)${PLAIN}"
         fi
     fi
 }
 
-# 检查网络连接
-check_network() {
-    echo -e "${BLUE}检查网络连接...${PLAIN}"
-    
-    local mirrors=(
-        "https://mirrors.aliyun.com"
-        "https://mirrors.163.com"
-        "https://mirrors.tuna.tsinghua.edu.cn"
-        "https://www.baidu.com"
-    )
-    
-    for mirror in "${mirrors[@]}"; do
-        if curl -s --connect-timeout 5 "$mirror" > /dev/null 2>&1; then
-            echo -e "${GREEN}网络连接正常（${mirror}）${PLAIN}"
-            return 0
+# 写操作共用同一把锁，避免多个管理会话交叉修改状态。
+with_admin_lock() (
+    if ! command -v flock >/dev/null; then
+        echo "缺少 flock（util-linux），无法安全执行此操作。" >&2
+        return 1
+    fi
+    exec 9>/run/lock/brian-bbr.lock || return 1
+    if ! flock -n 9; then
+        echo "另一个会话正在修改配置，请稍后重试。" >&2
+        return 1
+    fi
+    "$@"
+)
+
+check_kernel_management() {
+    if [[ "$virt_type" == openvz ]] || systemd-detect-virt --container --quiet 2>/dev/null; then
+        echo "容器使用宿主机内核，当前环境不执行内核安装或清理。" >&2
+        return 1
+    fi
+}
+
+check_bbr_available() {
+    if ! command -v sysctl >/dev/null; then
+        echo "缺少 sysctl，请安装 procps 后重试。" >&2
+        return 1
+    fi
+    if command -v modprobe >/dev/null; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
+        echo "当前内核或运行环境未提供 BBR，请检查内核、模块和容器权限。" >&2
+        return 1
+    fi
+}
+
+apply_sysctl_file() {
+    local file="$1" key expected actual
+    sysctl -p "$file" || return 1
+    while IFS='=' read -r key expected; do
+        [[ "$key" == \#* || -z "$key" ]] && continue
+        key=${key//[[:space:]]/}
+        actual=$(sysctl -n "$key") || return 1
+        if [[ "${actual//[[:space:]]/}" != "${expected//[[:space:]]/}" ]]; then
+            printf '参数回读不一致：%s（当前 %s，预期 %s）\n' "$key" "$actual" "$expected" >&2
+            return 1
         fi
-    done
-    
-    if ping -c 2 8.8.8.8 > /dev/null 2>&1; then
-        echo -e "${YELLOW}网络连接正常但HTTPS访问受限${PLAIN}"
-        return 0
-    else
-        echo -e "${RED}网络连接失败，请检查网络设置${PLAIN}"
-        return 1
-    fi
+    done < "$file"
 }
 
-# 检测BBR状态
-check_bbr_status() {
-    local param=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-    if [[ "$param" == "bbr" ]]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# 检测内核版本是否支持原生BBR
-check_kernel_native_bbr() {
-    local kernel_version=$(uname -r | cut -d- -f1)
-    local major=$(echo "$kernel_version" | cut -d. -f1)
-    local minor=$(echo "$kernel_version" | cut -d. -f2)
-    
-    # 内核4.9+支持BBR，5.4+为最佳
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        echo -e "${GREEN}当前内核 $kernel_version 原生支持BBR（最佳）${PLAIN}"
-        return 0
-    elif [[ $major -eq 4 && $minor -ge 9 ]] || [[ $major -ge 5 ]]; then
-        echo -e "${YELLOW}当前内核 $kernel_version 支持BBR（建议升级到5.4+）${PLAIN}"
-        return 0
-    else
-        echo -e "${RED}当前内核 $kernel_version 不支持BBR，需要升级${PLAIN}"
-        return 1
-    fi
-}
-
-# 启用BBR
 enable_bbr() {
-    if check_bbr_status; then
-        echo -e "${GREEN}BBR已经启用${PLAIN}"
-        return 0
-    fi
-    
-    if ! check_kernel_native_bbr; then
-        echo -e "${YELLOW}需要先升级内核才能启用BBR${PLAIN}"
+    local target=/etc/sysctl.d/99-brian-bbr.conf marker='# Managed by brian952700/bbr-script BBR'
+    local before candidate
+    if [[ -e "$TCP_TUNE_FILE" || -L "$TCP_TUNE_FILE" || -e "$TCP_TUNE_BACKUP" ]]; then
+        echo "已有 TCP 调优配置或恢复备份。请在菜单 3 管理它，恢复后再设置基础配置。"
         return 1
     fi
-    
-    echo -e "${BLUE}正在配置BBR...${PLAIN}"
-    
-    # 配置sysctl
-    cat > /etc/sysctl.d/99-bbr.conf <<EOF
-# BBR配置
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# 基础网络优化
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.netdev_max_backlog = 5000
-net.ipv4.tcp_max_syn_backlog = 8192
-EOF
-    
-    sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
-    
-    if check_bbr_status; then
-        echo -e "${GREEN}╔════════════════════════════════════════════╗${PLAIN}"
-        echo -e "${GREEN}║  BBR启用成功！                            ║${PLAIN}"
-        echo -e "${GREEN}║  您的网络加速已生效                       ║${PLAIN}"
-        echo -e "${GREEN}╚════════════════════════════════════════════╝${PLAIN}"
-        return 0
-    else
-        echo -e "${RED}BBR启用失败，请检查内核版本${PLAIN}"
+    if [[ -L "$target" ]] || { [[ -e "$target" ]] && ! grep -qxF "$marker" <(head -n 1 "$target"); }; then
+        echo "基础配置文件已存在且不属于脚本：$target" >&2
         return 1
     fi
+    check_bbr_available || return 1
+    before=$(mktemp) || return 1
+    if ! snapshot_sysctl_values net.core.default_qdisc net.ipv4.tcp_congestion_control > "$before"; then
+        rm -f -- "$before"
+        return 1
+    fi
+    candidate=$(mktemp /etc/sysctl.d/.brian-bbr.XXXXXX) || {
+        rm -f -- "$before"
+        return 1
+    }
+    if ! printf '%s\n' "$marker" 'net.core.default_qdisc = fq' \
+        'net.ipv4.tcp_congestion_control = bbr' > "$candidate"; then
+        rm -f -- "$before" "$candidate"
+        return 1
+    fi
+    if ! apply_sysctl_file "$candidate" || ! chmod 644 "$candidate" || ! mv -fT -- "$candidate" "$target"; then
+        echo "BBR + fq 设置失败，正在恢复原运行值。" >&2
+        if apply_sysctl_file "$before"; then
+            rm -f -- "$before"
+        else
+            echo "回退未完全成功，运行值备份：$before" >&2
+        fi
+        rm -f -- "$candidate"
+        return 1
+    fi
+    rm -f -- "$before"
+    echo "已验证 BBR + fq 默认值并保存：$target"
+    if [[ -e /etc/sysctl.d/99-bbr.conf ]]; then
+        echo "旧版 99-bbr.conf 已保留，其中额外的 TCP 参数仍可能生效。"
+    fi
+    echo "可用 tc qdisc show 查看现有网卡的实际队列。"
 }
 
 # 从当前 Debian 软件源安装本架构的内核元包，不更换软件源。
 upgrade_kernel_debian() {
+    check_kernel_management || return 1
+    check_boot_space || return 1
     local kernel_arch kernel_package
     kernel_arch=$(dpkg --print-architecture) || return 1
     case "$kernel_arch" in
@@ -238,7 +210,7 @@ upgrade_kernel_debian() {
             ;;
     esac
     echo -e "${BLUE}正在从当前 Debian 软件源安装/更新 $kernel_package...${PLAIN}"
-    if apt-get update && apt-get install -y "$kernel_package"; then
+    if apt-get update --error-on=any && apt-get install -y "$kernel_package"; then
         echo -e "${GREEN}内核包安装/更新完成；若安装了新内核，重启后生效。${PLAIN}"
         return 0
     fi
@@ -246,30 +218,80 @@ upgrade_kernel_debian() {
     return 1
 }
 
-# 卸载多余旧内核（保留当前和最新）
+# 只清理预览中的旧内核包，保留运行中的内核及最新备用内核。
 remove_old_kernels() {
-    echo -e "${YELLOW}检测旧内核...${PLAIN}"
-    
-        current_kernel=$(uname -r)
-        installed_kernels=$(dpkg -l | grep 'linux-image-[0-9]' | awk '{print $2}')
-        
-        echo -e "${YELLOW}当前运行内核: $current_kernel${PLAIN}"
-        echo -e "${YELLOW}已安装的内核：${PLAIN}"
-        echo "$installed_kernels"
-        
-        read -p "是否清理非当前内核? [y/N]: " confirm_remove
-        if [[ "$confirm_remove" =~ ^[Yy]$ ]]; then
-            for kernel in $installed_kernels; do
-                if [[ "$kernel" != *"$current_kernel"* ]]; then
-                    echo -e "${BLUE}移除旧内核: $kernel${PLAIN}"
-                    apt-get purge -y "$kernel" 2>/dev/null
-                fi
-            done
-            apt-get autoremove -y
-            echo -e "${GREEN}旧内核清理完成${PLAIN}"
+    check_kernel_management || return 1
+    local running installed pkg version status release running_pkg="" fallback="" fallback_version="" fallback_release=""
+    local preview action planned_pkg rest confirm
+    local -a candidates=()
+    local -A allowed=()
+    running=$(uname -r) || return 1
+    installed=$(dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Status}\n' 'linux-image-[0-9]*') || return 1
+    while IFS=$'\t' read -r pkg version status; do
+        [[ "$status" == installed ]] || continue
+        release=${pkg#linux-image-}
+        release=${release%-unsigned}
+        if [[ "$release" == "$running" ]]; then
+            running_pkg="$pkg"
+            continue
         else
-            echo -e "${YELLOW}已取消${PLAIN}"
+            if [[ -z "$fallback" ]] || dpkg --compare-versions "$version" gt "$fallback_version"; then
+                fallback="$pkg"
+                fallback_version="$version"
+                fallback_release="$release"
+            fi
         fi
+    done <<< "$installed"
+    if [[ -z "$running_pkg" ]]; then
+        echo "无法确认当前内核所属的 Debian 软件包，跳过清理。"
+        return 1
+    fi
+    if [[ -z "$fallback" ]]; then
+        echo "只有当前内核，没有需要清理的旧内核。"
+        return 0
+    fi
+    if [[ ! -f "/boot/vmlinuz-$fallback_release" ]]; then
+        echo "无法确认最新备用内核文件，跳过清理。"
+        return 1
+    fi
+    while IFS=$'\t' read -r pkg version status; do
+        [[ "$status" == installed ]] || continue
+        release=${pkg#linux-image-}
+        release=${release%-unsigned}
+        [[ "$release" != "$running" && "$release" != "$fallback_release" ]] || continue
+        candidates+=("$pkg")
+        allowed["$pkg"]=1
+    done <<< "$installed"
+    echo "保留 $running_pkg 和 $fallback。"
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        echo "没有需要清理的旧内核。"
+        return 0
+    fi
+    local -a apt_options=(-o APT::Get::AutomaticRemove=false -o APT::Get::Assume-Yes=false)
+    preview=$(LC_ALL=C apt-get "${apt_options[@]}" -s purge -- "${candidates[@]}") || return 1
+    printf '%s\n' "$preview"
+    while read -r action planned_pkg rest; do
+        case "$action" in
+            Remv|Purg)
+                planned_pkg=${planned_pkg%%:*}
+                if [[ -z "${allowed[$planned_pkg]:-}" ]]; then
+                    echo "APT 计划移除清理范围外的包：$planned_pkg。已停止。" >&2
+                    return 1
+                fi
+                ;;
+            Inst|Conf)
+                echo "APT 计划修改其他包，已停止清理。" >&2
+                return 1
+                ;;
+        esac
+    done <<< "$preview"
+    read -r -p "继续清理预览中的旧内核？[y/N] " confirm || return 0
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    if ! apt-get "${apt_options[@]}" purge -- "${candidates[@]}"; then
+        echo "内核清理失败，请检查 APT 输出。" >&2
+        return 1
+    fi
+    echo "旧内核清理完成。"
 }
 
 # 显示当前状态
@@ -312,9 +334,9 @@ TCP_TUNE_KEYS=(
     net.ipv4.tcp_slow_start_after_idle
 )
 
-snapshot_tcp_values() {
+snapshot_sysctl_values() {
     local key value
-    for key in "${TCP_TUNE_KEYS[@]}"; do
+    for key in "$@"; do
         value=$(sysctl -n "$key") || return 1
         printf '%s = %s\n' "$key" "$value" || return 1
     done
@@ -324,7 +346,7 @@ show_tcp_tuning() {
     echo "当前 TCP 参数："
     sysctl "${TCP_TUNE_KEYS[@]}"
     if [[ -f "$TCP_TUNE_FILE" ]]; then
-        echo "已启用调优配置：$TCP_TUNE_FILE"
+        echo "已保存的调优配置：$TCP_TUNE_FILE"
         head -n 2 "$TCP_TUNE_FILE"
     else
         echo "尚未启用本脚本的 TCP 调优。"
@@ -332,7 +354,7 @@ show_tcp_tuning() {
 }
 
 apply_tcp_tuning() {
-    local profile="$1" max_buffer before candidate mem_kb confirm
+    local profile="$1" max_buffer before candidate mem_kb confirm first_backup=0
     case "$profile" in
         balanced) max_buffer=33554432 ;;
         throughput)
@@ -345,8 +367,8 @@ apply_tcp_tuning() {
             ;;
         *) return 1 ;;
     esac
-    if [[ -e "$TCP_TUNE_FILE" ]] &&
-       ! grep -qxF '# Managed by brian952700/bbr-script TCP tuning' <(head -n 1 "$TCP_TUNE_FILE"); then
+    if [[ -L "$TCP_TUNE_FILE" ]] || { [[ -e "$TCP_TUNE_FILE" ]] &&
+       ! grep -qxF '# Managed by brian952700/bbr-script TCP tuning' <(head -n 1 "$TCP_TUNE_FILE"); }; then
         echo "调优文件不属于本脚本，请先手动检查：$TCP_TUNE_FILE"
         return 1
     fi
@@ -360,14 +382,10 @@ apply_tcp_tuning() {
     echo "不更换内核、不修改 Xray 配置。"
     read -r -p "确认应用? [y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
-    modprobe tcp_bbr 2>/dev/null || true
-    if ! sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
-        echo "当前内核没有可用的 BBR，请检查内核和模块。"
-        return 1
-    fi
+    check_bbr_available || return 1
     install -d -m 700 "$TCP_TUNE_STATE" || return 1
     before=$(mktemp "$TCP_TUNE_STATE/current.XXXXXX") || return 1
-    if ! snapshot_tcp_values > "$before"; then
+    if ! snapshot_sysctl_values "${TCP_TUNE_KEYS[@]}" > "$before"; then
         rm -f -- "$before"
         echo "无法读取全部参数，未应用调优。"
         return 1
@@ -395,20 +413,23 @@ EOF
         rm -f -- "$before" "$candidate"
         return 1
     fi
-    if [[ ! -e "$TCP_TUNE_BACKUP" ]] && ! cp -- "$before" "$TCP_TUNE_BACKUP"; then
-        rm -f -- "$before" "$candidate"
-        return 1
+    if [[ ! -e "$TCP_TUNE_BACKUP" ]]; then
+        if ! ln -- "$before" "$TCP_TUNE_BACKUP"; then
+            rm -f -- "$before" "$candidate"
+            return 1
+        fi
+        first_backup=1
     fi
-    if ! sysctl -p "$candidate"; then
-        echo "应用失败，尝试恢复本次操作前的运行值。"
-        sysctl -p "$before" || echo "恢复也失败，请检查：$before"
-        rm -f -- "$candidate"
-        echo "配置未保存；本次快照保留在：$before"
-        return 1
-    fi
-    if ! chmod 644 "$candidate" || ! mv -f -- "$candidate" "$TCP_TUNE_FILE"; then
-        echo "保存配置失败，尝试恢复本次操作前的运行值。"
-        sysctl -p "$before" || echo "恢复也失败，请检查：$before"
+    if ! apply_sysctl_file "$candidate" || ! chmod 644 "$candidate" || ! mv -fT -- "$candidate" "$TCP_TUNE_FILE"; then
+        echo "应用或保存失败，尝试恢复本次操作前的运行值。" >&2
+        if apply_sysctl_file "$before"; then
+            rm -f -- "$before"
+            if (( first_backup )); then
+                rm -f -- "$TCP_TUNE_BACKUP"
+            fi
+        else
+            echo "回退未完全成功，运行值备份：$before" >&2
+        fi
         rm -f -- "$candidate"
         return 1
     fi
@@ -424,8 +445,8 @@ restore_tcp_tuning() {
         echo "没有首次调优前的备份。"
         return 1
     fi
-    if [[ -e "$TCP_TUNE_FILE" ]] &&
-       ! grep -qxF '# Managed by brian952700/bbr-script TCP tuning' <(head -n 1 "$TCP_TUNE_FILE"); then
+    if [[ -L "$TCP_TUNE_FILE" ]] || { [[ -e "$TCP_TUNE_FILE" ]] &&
+       ! grep -qxF '# Managed by brian952700/bbr-script TCP tuning' <(head -n 1 "$TCP_TUNE_FILE"); }; then
         echo "文件不属于本脚本，停止恢复：$TCP_TUNE_FILE"
         return 1
     fi
@@ -434,22 +455,22 @@ restore_tcp_tuning() {
     read -r -p "确认恢复? [y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
     before=$(mktemp "$TCP_TUNE_STATE/restore.XXXXXX") || return 1
-    if ! snapshot_tcp_values > "$before"; then
+    if ! snapshot_sysctl_values "${TCP_TUNE_KEYS[@]}" > "$before"; then
         rm -f -- "$before"
         return 1
     fi
-    if ! sysctl -p "$TCP_TUNE_BACKUP"; then
+    if ! apply_sysctl_file "$TCP_TUNE_BACKUP"; then
         echo "恢复失败，尝试回退本次操作。"
-        sysctl -p "$before" || echo "回退也失败，请检查：$before"
+        apply_sysctl_file "$before" || echo "回退也失败，请检查：$before"
         echo "配置和备份保留。"
         return 1
     fi
     if ! rm -f -- "$TCP_TUNE_FILE"; then
         echo "无法移除持久配置，尝试回退运行值；备份保留。"
-        sysctl -p "$before"
+        apply_sysctl_file "$before"
         return 1
     fi
-    rm -f -- "$TCP_TUNE_BACKUP" "$before"
+    rm -f -- "$TCP_TUNE_BACKUP" "$before" || return 1
     echo "已恢复首次调优前参数，并移除调优文件。"
 }
 
@@ -464,10 +485,10 @@ tcp_tuning_menu() {
     echo "不是 BBR 算法升级，不保证提速；不作用于 QUIC/UDP 的拥塞控制。"
     read -r -p "请选择 [0-4]: " option
     case "$option" in
-        1) apply_tcp_tuning balanced ;;
-        2) apply_tcp_tuning throughput ;;
+        1) with_admin_lock apply_tcp_tuning balanced ;;
+        2) with_admin_lock apply_tcp_tuning throughput ;;
         3) show_tcp_tuning ;;
-        4) restore_tcp_tuning ;;
+        4) with_admin_lock restore_tcp_tuning ;;
         0) return 0 ;;
         *) echo "无效选择" ;;
     esac
@@ -484,7 +505,7 @@ show_menu() {
         printf '%b\n' \
             "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}" \
             "${BLUE}║       BBR一键加速脚本 v${sh_ver} (Brian版)        ║${PLAIN}" \
-            "${BLUE}║       仅支持 Debian 12+，自动检测依赖            ║${PLAIN}" \
+            "${BLUE}║       适用于 Debian 12 及以上            ║${PLAIN}" \
             "${BLUE}║                                                 ║${PLAIN}" \
             "${BLUE}║       维护者: brian952700           ║${PLAIN}" \
             "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}" \
@@ -505,17 +526,11 @@ show_menu() {
 
         case $choice in
             1)
-                if check_kernel_native_bbr; then
-                    enable_bbr
-                else
-                    echo -e "${YELLOW}当前内核不支持BBR，请先升级内核${PLAIN}"
-                    echo -e "${BLUE}提示：选择2安装 Debian 内核${PLAIN}"
-                fi
+                with_admin_lock enable_bbr
                 ;;
             2)
-                check_boot_space
-                if upgrade_kernel_debian; then
-                    read -r -p "是否现在重启? [y/N]: " reboot_now
+                if with_admin_lock upgrade_kernel_debian; then
+                    read -r -p "是否现在重启? [y/N]: " reboot_now || return 0
                     [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
                 fi
                 ;;
@@ -523,7 +538,7 @@ show_menu() {
                 tcp_tuning_menu
                 ;;
             4)
-                remove_old_kernels
+                with_admin_lock remove_old_kernels
                 ;;
             5)
                 show_status
@@ -549,8 +564,6 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 
 # 执行所有预检查
-check_dependencies || exit 1
-check_network || exit 1
 check_virt
 
 echo ""
@@ -559,7 +572,3 @@ echo -e "${GREEN}预检查完成！${PLAIN}"
 # 脚本入口
 MENU_KERNEL_RELEASE=$(uname -r)
 show_menu
-
-
-
-
